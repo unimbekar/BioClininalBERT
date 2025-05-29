@@ -1,0 +1,112 @@
+# Bio_ClinicalBERT Kaggle Notebook (Updated)
+# Biomedical Multi-label Text Classification with Zero-Shot + Embedding Clustering Labeling
+
+# ====================
+# 📦 Install dependencies
+# ====================
+!pip install -q transformers datasets scikit-learn sentence-transformers
+
+# ====================
+# 📚 Import libraries
+# ====================
+import pandas as pd
+import numpy as np
+import torch
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.cluster import KMeans
+from sklearn.metrics import f1_score, precision_score, recall_score
+import re
+
+# ====================
+# 📁 Load & preprocess data
+# ====================
+DATA_PATH = "/kaggle/input/YOUR-DATASET-NAME/clinical_notes.csv"  # <- Change this
+LABELS = ['diabetes', 'hypertension', 'cancer', 'mental_health', 'alcohol_use']
+
+# Text preprocessing
+def preprocess_notes(text):
+    text = re.sub(r"\n+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# Load data
+df = pd.read_csv(DATA_PATH)
+df['text'] = df['text'].astype(str).apply(preprocess_notes)
+
+# ====================
+# 🧠 Zero-Shot Classification to Generate Weak Labels
+# ====================
+classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli", device=0 if torch.cuda.is_available() else -1)
+
+# Assign labels to each note based on threshold
+THRESHOLD = 0.4  # adjust as needed
+
+def zero_shot_labels(text):
+    result = classifier(text, LABELS, multi_label=True)
+    return [label for label, score in zip(result['labels'], result['scores']) if score > THRESHOLD]
+
+df['labels'] = df['text'].apply(zero_shot_labels)
+
+# ====================
+# 🧾 Tokenize and encode labels
+# ====================
+tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+
+class ClinicalDataset(torch.utils.data.Dataset):
+    def __init__(self, texts, labels, tokenizer):
+        self.encodings = tokenizer(texts, truncation=True, padding=True, max_length=512)
+        self.labels = labels
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx]).float()
+        return item
+    def __len__(self):
+        return len(self.labels)
+
+mlb = MultiLabelBinarizer(classes=LABELS)
+Y = mlb.fit_transform(df['labels'])
+train_dataset = ClinicalDataset(df['text'].tolist(), Y, tokenizer)
+
+# ====================
+# 🤖 Fine-tune Bio_ClinicalBERT
+# ====================
+model = AutoModelForSequenceClassification.from_pretrained(
+    "emilyalsentzer/Bio_ClinicalBERT",
+    num_labels=len(LABELS),
+    problem_type="multi_label_classification"
+)
+
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="no",
+    per_device_train_batch_size=4,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    logging_dir="./logs",
+    save_strategy="no"
+)
+
+def compute_metrics(pred):
+    logits, labels = pred
+    preds = (torch.sigmoid(torch.tensor(logits)) > 0.5).int().numpy()
+    labels = labels.astype(int)
+    return {
+        "micro_f1": f1_score(labels, preds, average="micro"),
+        "macro_f1": f1_score(labels, preds, average="macro"),
+        "micro_precision": precision_score(labels, preds, average="micro"),
+        "micro_recall": recall_score(labels, preds, average="micro")
+    }
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    compute_metrics=compute_metrics
+)
+
+trainer.train()
+
+# Save the fine-tuned model
+trainer.save_model("/kaggle/working/bioclinicalbert_multilabel")
